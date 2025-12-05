@@ -1,0 +1,85 @@
+// Load the administrative boundaries collection for Mexico
+var states = ee.FeatureCollection("FAO/GAUL/2015/level1")
+                .filter(ee.Filter.eq('ADM0_NAME', 'Mexico'));
+
+// Function to calculate NDVI, SAVI, NDWI and add nighttime lights intensity
+function calculateIndices(image) {
+  var ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+  var savi = image.expression(
+    '((NIR - RED) / (NIR + RED + L)) * (1 + L)', {
+      'NIR': image.select('SR_B5'),
+      'RED': image.select('SR_B4'),
+      'L': 0.5  // Correction factor L for SAVI
+    }).rename('SAVI');
+  var ndwi = image.normalizedDifference(['SR_B3', 'SR_B5']).rename('NDWI');
+  return image.addBands([ndvi, savi, ndwi]);
+}
+
+// Function to get the annual mean of nighttime lights
+function getNighttimeLights(year) {
+  var startDate = ee.Date.fromYMD(year, 1, 1);
+  var endDate = ee.Date.fromYMD(year, 12, 31);
+  
+  var nighttimeLights = ee.ImageCollection("NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG")
+                          .filterDate(startDate, endDate)
+                          .select('avg_rad')
+                          .mean()
+                          .rename('NighttimeLights');
+  
+  return nighttimeLights;
+}
+
+// Define the years of interest
+var years = ee.List.sequence(2016, 2022);
+
+// Iterate over each state and year to calculate the indices
+var results = states.map(function(state) {
+  var stateName = state.getString('ADM1_NAME');
+  
+  var annualResults = years.map(function(year) {
+    // Landsat 8 image collection and calculation of NDVI, SAVI, NDWI
+    var landsatCollection = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+                                .filterBounds(state.geometry())
+                                .filterDate(ee.Date.fromYMD(year, 1, 1), ee.Date.fromYMD(year, 12, 31))
+                                .filter(ee.Filter.lt('CLOUD_COVER', 20))
+                                .map(calculateIndices)
+                                .select(['NDVI', 'SAVI', 'NDWI']);
+    
+    var annualMeanIndices = landsatCollection.mean();
+    
+    // Get the annual mean of nighttime lights
+    var annualNighttimeLights = getNighttimeLights(year).clip(state.geometry());
+    
+    // Combine all indices into a single image
+    var annualImage = annualMeanIndices.addBands(annualNighttimeLights);
+
+    // Reduce to get the mean value of each index and nighttime lights in the state's region
+    var reduction = annualImage.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: state.geometry(),
+      scale: 500,
+      maxPixels: 1e13
+    });
+
+    // Return a feature with the year, state, and mean values
+    return ee.Feature(null, {
+      'Year': year,
+      'State': stateName,
+      'NDVI': reduction.get('NDVI'),
+      'SAVI': reduction.get('SAVI'),
+      'NDWI': reduction.get('NDWI'),
+      'NighttimeLights': reduction.get('NighttimeLights')
+    });
+  });
+  
+  return ee.FeatureCollection(annualResults);
+}).flatten();
+
+// Export the table to Google Drive in CSV format
+Export.table.toDrive({
+  collection: results,
+  description: 'Indices_NighttimeLights_States_Mexico_2016_2022',
+  fileFormat: 'CSV'
+});
+
+print("Export of NDVI, SAVI, NDWI, and Nighttime Lights by state ready for export as CSV.");
